@@ -3,22 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::paths;
 
-/// Company routing template: `company/template.json` under the data dir.
-/// Domains and networks stay out of the source tree; keys come from the imported conf.
+/// Empty shell; routing fields are filled from an imported WireGuard conf.
 pub fn default_profile() -> CompanyProfile {
-    let template = paths::data_dir()
-        .ok()
-        .map(|dir| dir.join("company").join("template.json"))
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|raw| serde_json::from_str::<CompanyProfile>(&raw).ok());
-    if let Some(mut profile) = template {
-        profile.enabled = false;
-        profile.private_key = String::new();
-        profile.public_key = String::new();
-        profile.pre_shared_key = None;
-        profile.updated_at = String::new();
-        return profile;
-    }
     CompanyProfile {
         enabled: false,
         private_key: String::new(),
@@ -157,8 +143,7 @@ pub fn clear_profile() -> AppResult<()> {
 }
 
 /// Enable company VPN from a WireGuard .conf.
-/// WireGuard transport fields from conf override the built-in template;
-/// domain / CIDRs / conflict IPs stay on the company template.
+/// Domain comes from DNS search domains or Endpoint host; CIDRs from AllowedIPs.
 pub fn enable_from_conf(raw: &str) -> AppResult<CompanyProfile> {
     let keys = parse_keys(raw)?;
     enable_from_keys(
@@ -188,11 +173,6 @@ pub fn enable_from_keys(
     persistent_keepalive: Option<u16>,
 ) -> AppResult<CompanyProfile> {
     let mut profile = load_profile().unwrap_or_else(|_| default_profile());
-    if profile.domain.trim().is_empty() {
-        return Err(AppError::from(
-            "缺少公司域名模板，请在数据目录 company/template.json 中配置 domain",
-        ));
-    }
     profile.private_key = private_key.trim().to_string();
     profile.public_key = public_key.trim().to_string();
     profile.pre_shared_key = pre_shared_key
@@ -208,25 +188,97 @@ pub fn enable_from_keys(
         profile.server = ep.0;
         profile.port = ep.1;
     }
-    if let Some(dns) = dns {
-        let dns = dns.split(',').next().unwrap_or(&dns).trim().to_string();
-        if !dns.is_empty() {
-            profile.dns = dns;
-        }
+    let dns_parts = dns
+        .as_deref()
+        .map(split_dns_field)
+        .unwrap_or_default();
+    if let Some(dns_ip) = dns_parts.ips.first() {
+        profile.dns = dns_ip.clone();
     }
-    profile.allowed_ips = allowed_ips;
+    if !allowed_ips.is_empty() {
+        profile.allowed_ips = allowed_ips.clone();
+        profile.cidrs = allowed_ips;
+    }
     profile.mtu = mtu;
     profile.persistent_keepalive = persistent_keepalive;
-    if profile.server.trim().is_empty() {
-        profile.server = format!("navigator.{}", profile.domain);
+
+    let mut domain = dns_parts
+        .domains
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    if domain.is_empty() {
+        domain = domain_from_host(&profile.server).unwrap_or_default();
     }
-    profile.enabled = true;
-    profile.updated_at = chrono::Local::now().to_rfc3339();
+    if !domain.is_empty() {
+        profile.domain = domain;
+    }
+    for d in dns_parts.domains.into_iter().skip(1) {
+        if d != profile.domain && !profile.custom_company.iter().any(|x| x == &d) {
+            profile.custom_company.push(d);
+        }
+    }
+
     if profile.private_key.is_empty() || profile.public_key.is_empty() {
         return Err(AppError::from("PrivateKey / PublicKey 不能为空"));
     }
+    if profile.server.trim().is_empty() || profile.port == 0 {
+        return Err(AppError::from("配置缺少 Endpoint"));
+    }
+    if profile.domain.trim().is_empty() && profile.cidrs.is_empty() {
+        return Err(AppError::from(
+            "配置缺少可识别的公司域名（DNS / Endpoint）和 AllowedIPs",
+        ));
+    }
+    profile.enabled = true;
+    profile.updated_at = chrono::Local::now().to_rfc3339();
     save_profile(&profile)?;
     Ok(profile)
+}
+
+#[derive(Debug, Default)]
+struct DnsParts {
+    ips: Vec<String>,
+    domains: Vec<String>,
+}
+
+fn split_dns_field(raw: &str) -> DnsParts {
+    let mut parts = DnsParts::default();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if looks_like_ip(item) {
+            parts.ips.push(item.to_string());
+        } else if item.contains('.') {
+            parts.domains.push(item.trim_end_matches('.').to_ascii_lowercase());
+        }
+    }
+    parts
+}
+
+fn looks_like_ip(value: &str) -> bool {
+    if value.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    value.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
+/// `navigator.example.com` → `example.com`; bare hosts stay as-is when they look like domains.
+fn domain_from_host(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || looks_like_ip(&host) {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() >= 3 {
+        Some(labels[1..].join("."))
+    } else if labels.len() >= 2 {
+        Some(host)
+    } else {
+        None
+    }
 }
 
 /// Parse `host:port` or `[ipv6]:port`.
@@ -308,9 +360,7 @@ fn parse_keys(raw: &str) -> AppResult<WgKeys> {
             ("interface", "address") => {
                 draft.address = value.split(',').next().map(|s| s.trim().to_string());
             }
-            ("interface", "dns") => {
-                draft.dns = value.split(',').next().map(|s| s.trim().to_string());
-            }
+            ("interface", "dns") => draft.dns = Some(value.to_string()),
             ("interface", "mtu") => {
                 draft.mtu = value.parse::<u16>().ok().filter(|v| *v >= 576);
             }
@@ -356,7 +406,7 @@ fn regex_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_keys;
+    use super::{domain_from_host, parse_keys, split_dns_field};
 
     #[test]
     fn parses_wireguard_transport_options() {
@@ -364,7 +414,7 @@ mod tests {
 [Interface]
 PrivateKey = private
 Address = 10.20.0.2/32
-DNS = 10.20.0.1
+DNS = 10.20.0.1, 8.8.8.8, corp.example.com
 MTU = 1360
 
 [Peer]
@@ -380,5 +430,16 @@ PersistentKeepalive = 20
         assert_eq!(parsed.persistent_keepalive, Some(20));
         assert_eq!(parsed.allowed_ips, vec!["10.30.0.0/24", "10.40.0.0/24"]);
         assert_eq!(parsed.endpoint.as_deref(), Some("vpn.example.com:1195"));
+        assert_eq!(
+            parsed.dns.as_deref(),
+            Some("10.20.0.1, 8.8.8.8, corp.example.com")
+        );
+        let dns = split_dns_field(parsed.dns.as_deref().unwrap());
+        assert_eq!(dns.ips, vec!["10.20.0.1", "8.8.8.8"]);
+        assert_eq!(dns.domains, vec!["corp.example.com"]);
+        assert_eq!(
+            domain_from_host("navigator.corp.example.com").as_deref(),
+            Some("corp.example.com")
+        );
     }
 }

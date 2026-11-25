@@ -133,27 +133,43 @@ fn find_free_port(preferred: u16, candidates: &[u16]) -> AppResult<u16> {
     )))
 }
 
-/// Kill stale mihomo leftovers that keep mixed-port / API after app reload.
+fn is_mihomo_image(pid: u32) -> bool {
+    process_image_name(pid)
+        .map(|name| name.eq_ignore_ascii_case("mihomo.exe"))
+        .unwrap_or(false)
+}
+
+/// Kill leftover mihomo for this data dir. Do not kill unrelated listeners
+/// (another proxy may own the old default port).
 fn cleanup_stale_cores(settings: &AppSettings, keep_pid: Option<u32>) {
     let Ok(data_dir) = paths::data_dir() else {
         return;
     };
     let data_key = data_dir.to_string_lossy().to_ascii_lowercase();
     let ports = [settings.mixed_port, controller_port(settings)];
-
-    for pid in mihomo_pids_using_data_dir(&data_key) {
+    let mut doomed = mihomo_pids_using_data_dir(&data_key);
+    for port in ports {
+        for pid in listening_pids(port) {
+            if is_mihomo_image(pid) && !doomed.contains(&pid) {
+                doomed.push(pid);
+            }
+        }
+    }
+    for pid in doomed {
         if Some(pid) != keep_pid {
             let _ = kill_pid(pid);
         }
     }
-    for port in ports {
-        for pid in listening_pids(port) {
-            if Some(pid) != keep_pid {
-                let _ = kill_pid(pid);
-            }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let left = mihomo_pids_using_data_dir(&data_key)
+            .into_iter()
+            .any(|pid| Some(pid) != keep_pid);
+        if !left {
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
 fn claim_port(preferred: u16, candidates: &[u16], allow_relocate: bool) -> AppResult<u16> {
@@ -260,6 +276,43 @@ fn listening_pids(port: u16) -> Vec<u32> {
 }
 
 fn mihomo_pids_using_data_dir(data_key: &str) -> Vec<u32> {
+    let text = process_list_mihomo();
+    let mut pids = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((pid_s, cmd)) = line.split_once('|') else {
+            continue;
+        };
+        let Ok(pid) = pid_s.trim().parse::<u32>() else {
+            continue;
+        };
+        if cmd.to_ascii_lowercase().contains(data_key) && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn process_list_mihomo() -> String {
+    let mut ps = Command::new("powershell");
+    ps.args([
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name='mihomo.exe'\" | ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }",
+    ]);
+    hide_console(&mut ps);
+    if let Some(output) = ps.output().ok() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+    }
+
     let mut cmd = Command::new("wmic");
     cmd.args([
         "process",
@@ -270,33 +323,70 @@ fn mihomo_pids_using_data_dir(data_key: &str) -> Vec<u32> {
         "/FORMAT:LIST",
     ]);
     hide_console(&mut cmd);
-    let output = cmd.output().ok();
-    let Some(output) = output else {
-        return Vec::new();
+    let Some(output) = cmd.output().ok() else {
+        return String::new();
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut pids = Vec::new();
+    let mut out = String::new();
     let mut cmdline = String::new();
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() {
-            cmdline.clear();
-            continue;
-        }
         if let Some(rest) = line.strip_prefix("CommandLine=") {
-            cmdline = rest.to_ascii_lowercase();
+            cmdline = rest.to_string();
             continue;
         }
         if let Some(rest) = line.strip_prefix("ProcessId=") {
             if let Ok(pid) = rest.trim().parse::<u32>() {
-                if !cmdline.is_empty() && cmdline.contains(data_key) && !pids.contains(&pid) {
-                    pids.push(pid);
+                if !cmdline.is_empty() {
+                    out.push_str(&format!("{pid}|{cmdline}\n"));
                 }
             }
             cmdline.clear();
         }
     }
-    pids
+    out
+}
+
+fn port_accepts_local(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{port}");
+    let Ok(sock) = addr.parse() else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(250)).is_ok()
+}
+
+fn recent_core_log() -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(path) = paths::log_path() else {
+        return String::new();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    let start = len.saturating_sub(16 * 1024);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return String::new();
+    }
+    let interesting: Vec<&str> = text
+        .lines()
+        .rev()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("level=error")
+                || lower.contains("level=fatal")
+                || lower.contains("listen")
+                || lower.contains("already")
+        })
+        .take(3)
+        .collect();
+    interesting.into_iter().rev().collect::<Vec<_>>().join(" | ")
 }
 
 fn process_image_name(pid: u32) -> Option<String> {
@@ -413,23 +503,26 @@ pub fn start_core(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
     *guard = Some(child);
     drop(guard);
 
-    // GeoSite/GeoIP load can take seconds; poll until our mixed-port is bound.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    // GeoIP/TUN init can take well over 12s. Killing early looks like "port not listening"
+    // even when the chosen port is free.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut exited = false;
     loop {
-        if listening_pids(settings.mixed_port)
-            .iter()
-            .any(|p| *p == child_pid)
-        {
+        let listeners = listening_pids(settings.mixed_port);
+        let ours = listeners.iter().any(|p| *p == child_pid);
+        let foreign = listeners.iter().any(|p| *p != child_pid);
+        let alive = is_running(&state);
+        if ours || (alive && !foreign && port_accepts_local(settings.mixed_port)) {
             return Ok(());
         }
-        // Child exited early.
-        if !is_running(&state) {
+        if !alive {
+            exited = true;
             break;
         }
         if std::time::Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     let mixed_pids = listening_pids(settings.mixed_port);
@@ -443,9 +536,20 @@ pub fn start_core(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
             )
         })
         .unwrap_or_else(|| "未监听".into());
+    let extra = recent_core_log();
+    let why = if exited {
+        "内核进程已退出"
+    } else {
+        "内核仍在启动，超时内没有开始监听"
+    };
+    let log_hint = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" 日志：{extra}")
+    };
     Err(AppError::from(format!(
-        "mixed-port {} 未能由当前内核占用（现占用者：{}）。节点切换会失效，请关闭冲突代理后重启内核。",
-        settings.mixed_port, holder
+        "mixed-port {} 未能由当前内核占用（{}，现占用者：{}）。{log_hint}",
+        settings.mixed_port, why, holder
     )))
 }
 

@@ -1162,6 +1162,55 @@ pub async fn test_proxy_delay(
     api::proxy_delay(&settings, &name, 5000, url.as_deref()).await
 }
 
+/// Company VPN health check: TCP to company DNS (or domain:443) via mixed-port.
+/// Do not use HTTPS against the WireGuard Endpoint host — that is UDP, not a website.
+#[tauri::command]
+pub async fn check_company(settings_state: State<'_, SettingsState>) -> AppResult<u32> {
+    let settings = read_settings(&settings_state)?;
+    let profile = company::load_enabled()?.ok_or_else(|| AppError::from("未启用公司 VPN"))?;
+    let mut hosts: Vec<String> = Vec::new();
+    let push_host = |hosts: &mut Vec<String>, host: &str| {
+        let host = host.trim();
+        if !host.is_empty() && !hosts.iter().any(|h| h == host) {
+            hosts.push(host.to_string());
+        }
+    };
+    push_host(&mut hosts, &profile.dns);
+    for cidr in &profile.cidrs {
+        if let Some(ip) = cidr.split('/').next() {
+            let ip = ip.trim();
+            if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                if cidr.ends_with("/24") {
+                    if let Some((base, _)) = ip.rsplit_once('.') {
+                        push_host(&mut hosts, &format!("{base}.1"));
+                    }
+                }
+                if cidr.ends_with("/32") {
+                    push_host(&mut hosts, ip);
+                }
+            }
+        }
+        if hosts.len() >= 4 {
+            break;
+        }
+    }
+    if hosts.is_empty() {
+        return Err(AppError::from("公司配置缺少可探测的 DNS / 网段"));
+    }
+
+    // Prefer DNS/53 (TCP); fall back to 443 in case the resolver is UDP-only.
+    let mut last_err = AppError::from("公司网络探测失败");
+    for host in &hosts {
+        for port in [53_u16, 443] {
+            match api::socks5_connect_ms(settings.mixed_port, host, port, 4000).await {
+                Ok(ms) => return Ok(ms),
+                Err(e) => last_err = e,
+            }
+        }
+    }
+    Err(last_err)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelayItem {

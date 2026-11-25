@@ -105,23 +105,17 @@ pub fn build_config(
     ];
 
     if let Some(c) = company {
-        let dns_via = format!("{}#{}", c.dns, c.name);
-        let mut policy = Mapping::new();
-        let mut company_domains = vec![c.domain.clone()];
-        company_domains.extend(
-            c.custom_company
-                .iter()
-                .map(|d| d.trim().to_string())
-                .filter(|d| !d.is_empty()),
-        );
-        for domain in company_domains {
-            fake_ip_filter.insert(0, Value::from(format!("+.{domain}")));
-            policy.insert(
-                Value::from(format!("+.{domain}")),
-                Value::from(dns_via.clone()),
-            );
+        // Resolve the WireGuard endpoint with public DNS. Putting the company
+        // suffix on the internal resolver deadlocks: the endpoint is under that
+        // suffix, and the internal DNS is only reachable through the tunnel.
+        // Company hostnames stay on fake-ip and are resolved inside WireGuard.
+        let server = c.server.trim();
+        if !server.is_empty() && server.parse::<std::net::IpAddr>().is_err() {
+            fake_ip_filter.insert(0, Value::from(server));
+            let mut policy = Mapping::new();
+            policy.insert(Value::from(server), Value::from("223.5.5.5"));
+            dns.insert(Value::from("nameserver-policy"), Value::Mapping(policy));
         }
-        dns.insert(Value::from("nameserver-policy"), Value::Mapping(policy));
     }
     dns.insert(
         Value::from("fake-ip-filter"),
@@ -278,11 +272,16 @@ pub fn build_config(
     }
     if let Some(c) = company {
         let company_policy = crate::settings::POLICY_COMPANY;
-        rules.push(Value::from(format!("DOMAIN,{},DIRECT", c.server)));
-        rules.push(Value::from(format!(
-            "DOMAIN-SUFFIX,{},{}",
-            c.domain, company_policy
-        )));
+        if !c.server.trim().is_empty() {
+            rules.push(Value::from(format!("DOMAIN,{},DIRECT", c.server.trim())));
+        }
+        if !c.domain.trim().is_empty() {
+            rules.push(Value::from(format!(
+                "DOMAIN-SUFFIX,{},{}",
+                c.domain.trim(),
+                company_policy
+            )));
+        }
         for d in &c.custom_company {
             if !d.trim().is_empty() {
                 rules.push(Value::from(format!(
@@ -293,6 +292,9 @@ pub fn build_config(
             }
         }
         for cidr in &c.cidrs {
+            if cidr.trim().is_empty() {
+                continue;
+            }
             if cidr.contains(':') {
                 rules.push(Value::from(format!(
                     "IP-CIDR6,{},{},no-resolve",

@@ -42,6 +42,7 @@ import {
   AppSettings,
   SettingsPayload,
   StatusPayload,
+  checkCompany,
   testProxyDelay,
   testProxyDelays,
   updateAirport,
@@ -805,10 +806,6 @@ function App() {
                         if (settingsPayload?.company?.enabled) {
                           const companyName =
                             settingsPayload.company.name || "公司VPN";
-                          const domain =
-                            settingsPayload.company.domain ||
-                            settingsPayload.company.domains?.[0] ||
-                            "";
                           const policyNow =
                             policyGroups?.company?.now ||
                             settingsPayload.settings.policyCompany ||
@@ -826,10 +823,8 @@ function App() {
                               setCompanyCheck("ok");
                               setCompanyCheckText(`策略·代理 ${ms} ms`);
                             } else {
-                              const ms = await testProxyDelay(
-                                policyNow || companyName,
-                                domain ? `https://navigator.${domain}` : undefined,
-                              );
+                              // WG Endpoint is UDP, not HTTPS; probe company DNS via mixed-port.
+                              const ms = await checkCompany();
                               setCompanyCheck("ok");
                               setCompanyCheckText(`${ms} ms`);
                             }
@@ -1620,7 +1615,7 @@ function App() {
                         <span>
                           {settingsPayload?.company
                             ? settingsPayload.company.endpoint
-                            : "内置分流模板，选择 conf 文件导入"}
+                            : "选择 WireGuard conf 文件导入"}
                         </span>
                       </div>
                     </div>
@@ -2207,8 +2202,8 @@ function App() {
               </button>
             </div>
             <p className="hint">
-              域名 / 网段 / 冲突 IP 已内置；conf 中的密钥、Endpoint、Address、DNS
-              会覆盖模板。选择文件导入后用开关启停。
+              只需导入 WireGuard conf。域名从 DNS / Endpoint 识别，网段来自
+              AllowedIPs。导入后用开关启停。
             </p>
             <div className="company-enable-row">
               <div>

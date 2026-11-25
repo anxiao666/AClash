@@ -147,6 +147,91 @@ pub async fn proxy_delay(
     Ok(delay)
 }
 
+/// TCP connect via local mixed-port (SOCKS5). Used for company VPN health checks:
+/// WireGuard endpoints are not HTTPS sites, and gstatic is outside AllowedIPs.
+pub async fn socks5_connect_ms(
+    mixed_port: u16,
+    dest_host: &str,
+    dest_port: u16,
+    timeout_ms: u64,
+) -> AppResult<u32> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let host = dest_host.trim();
+    if host.is_empty() || dest_port == 0 {
+        return Err(AppError::from("探测目标无效"));
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(500));
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(timeout, async {
+        let mut stream = TcpStream::connect(("127.0.0.1", mixed_port)).await?;
+        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greet = [0u8; 2];
+        stream.read_exact(&mut greet).await?;
+        if greet[0] != 0x05 || greet[1] != 0x00 {
+            return Err(std::io::Error::other("SOCKS5 握手失败"));
+        }
+
+        let mut req = vec![0x05, 0x01, 0x00];
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            req.push(0x01);
+            req.extend_from_slice(&ip.octets());
+        } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+            req.push(0x04);
+            req.extend_from_slice(&ip.octets());
+        } else {
+            let bytes = host.as_bytes();
+            if bytes.len() > 255 {
+                return Err(std::io::Error::other("主机名过长"));
+            }
+            req.push(0x03);
+            req.push(bytes.len() as u8);
+            req.extend_from_slice(bytes);
+        }
+        req.push((dest_port >> 8) as u8);
+        req.push((dest_port & 0xff) as u8);
+        stream.write_all(&req).await?;
+
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head).await?;
+        if head[0] != 0x05 || head[1] != 0x00 {
+            return Err(std::io::Error::other(format!(
+                "SOCKS5 连接失败 code={}",
+                head[1]
+            )));
+        }
+        match head[3] {
+            0x01 => {
+                let mut skip = [0u8; 4 + 2];
+                stream.read_exact(&mut skip).await?;
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut skip = vec![0u8; len[0] as usize + 2];
+                stream.read_exact(&mut skip).await?;
+            }
+            0x04 => {
+                let mut skip = [0u8; 16 + 2];
+                stream.read_exact(&mut skip).await?;
+            }
+            _ => return Err(std::io::Error::other("SOCKS5 地址类型未知")),
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            let ms = started.elapsed().as_millis() as u32;
+            Ok(ms.max(1))
+        }
+        Ok(Err(e)) => Err(AppError::from(format!("公司网络探测失败: {e}"))),
+        Err(_) => Err(AppError::from("公司网络探测超时")),
+    }
+}
+
 fn urlencoding_path(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {

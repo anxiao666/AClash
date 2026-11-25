@@ -262,6 +262,7 @@ pub fn run() {
             commands::read_text_file,
             commands::quit_app,
             commands::test_proxy_delay,
+            commands::check_company,
             commands::test_proxy_delays,
             commands::get_outbound_ip,
             commands::get_autostart,

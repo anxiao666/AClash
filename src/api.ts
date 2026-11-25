@@ -252,6 +252,10 @@ export async function testProxyDelay(name: string, url?: string) {
   return invoke<number>("test_proxy_delay", { name, url: url || null });
 }
 
+export async function checkCompany() {
+  return invoke<number>("check_company");
+}
+
 export type IpItem = {
   key: string;
   label: string;
