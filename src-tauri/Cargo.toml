@@ -1,6 +1,6 @@
 [package]
 name = "aclash"
-version = "0.1.12"
+version = "0.1.13"
 description = "AClash — lightweight Windows tray client for mihomo"
 authors = ["you"]
 edition = "2021"

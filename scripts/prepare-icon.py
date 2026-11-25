@@ -1,8 +1,10 @@
+import sys
 from PIL import Image
 from pathlib import Path
 
-src = Path(r"C:\Users\EDY\.cursor\projects\e-WorkSpace-mihomo\assets\aclash-icon-v1.jpg")
-out = Path(r"E:\WorkSpace\mihomo\src-tauri\app-icon.png")
+root = Path(__file__).resolve().parent.parent
+src = Path(sys.argv[1])
+out = root / "src-tauri" / "app-icon.png"
 
 img = Image.open(src).convert("RGBA")
 w, h = img.size
